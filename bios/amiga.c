@@ -10,7 +10,7 @@
  * option any later version.  See doc/license.txt for details.
  */
 
-/* #define ENABLE_KDEBUG */
+#define ENABLE_KDEBUG
 
 #include "config.h"
 #include "portab.h"
@@ -2299,6 +2299,183 @@ static void AddConfigDev(struct ConfigDev *configDev)
 {
     KDEBUG(("AddConfigDev %p\n", configDev));
     AddTail(&boardList, (struct Node *)configDev);
+}
+
+/* http://aros.sourceforge.net/de/documentation/developers/autodocs/expansion.php#writeexpansionword
+ * WriteExpansionWord() is used to configure Zorro III boards.
+ * It makes the ExpansionRom metadata disappear from "board" address,
+ * then the real board appears at its final location.
+ * Here, we add an extra parameter "configDev" specially for UAE hacks.
+ * Normally, the AUTOCONFIG protocol maps Zorro III boards to 0x40000000.
+ * But during WriteExpansionWord, UAE may force the board to be mapped to 0x10000000.
+ * This happens with WinUAE when the following option is defined:
+ * Settings > Hardware > RAM > Z3 mapping mode > UAE (0x10000000)
+ * In that case, UAE expects to find the configDev pointer in A3 register.
+ * This is why we need to implement this routine in assembly language.
+ * UAE may override the cd_BoardAddr and cd_SlotAddr fields with the forced location.
+ * See WinUAE source below for details, in function expamemz3_map():
+ * https://github.com/tonioni/WinUAE/blob/master/expansion.cpp */
+static void WriteExpansionWord_UAE(APTR board, ULONG offset, ULONG word, struct ConfigDev *configDev)
+{
+    /* Byte control registers are always spaced out to 4 bytes */
+    UBYTE *adr = (UBYTE *)board + (offset * 4);
+
+    __asm__ volatile
+    (
+        "move.l  %0,a3\n\t"     /* configDev must be in A3 */
+        "move.b  %2,4(%1)\n\t"  /* Write Low byte */
+        "move.w  %2,(%1)"       /* Write High and Low bytes as a WORD */
+    : /* outputs */
+    : "g"(configDev), "a"(adr), "d"(word) /* inputs */
+    : "a3" AND_MEMORY /* clobbered */
+    );
+}
+
+static void writeexpansion(APTR board, struct ConfigDev *configDev, UBYTE type, UWORD startaddr)
+{
+    /*UBYTE ec_Interrupt; // 16
+    UBYTE ec_Z3_HighBase; // 17
+    UBYTE ec_BaseAddress; // 18
+    */
+    if (type == ERT_ZORROII)
+    {
+        WriteExpansionByte(board, 18, startaddr);
+    }
+    else
+    {
+        WriteExpansionWord_UAE(board, 17, startaddr, configDev);
+    }
+}
+
+#define Z3SLOT 0x01000000
+#define Z2SLOTS         240
+#define SLOTSPERBYTE    8
+
+static UBYTE eb_z2Slots[Z2SLOTS/SLOTSPERBYTE];
+static UWORD eb_z3Slot;
+
+static BOOL config_board(APTR board, struct ConfigDev *configDev)
+{
+    UBYTE type = configDev->cd_Rom.er_Type & ERT_TYPEMASK;
+    BOOL memorydevice;
+    ULONG size = configDev->cd_BoardSize;
+
+    KDEBUG(("Configuring board: cd=%p mfg=%d prod=%d size=%08lx type=%02x\n",
+        configDev, configDev->cd_Rom.er_Manufacturer, configDev->cd_Rom.er_Product, size, configDev->cd_Rom.er_Type));
+
+    memorydevice = (configDev->cd_Rom.er_Type & ERTF_MEMLIST) != 0;
+    if (type == ERT_ZORROIII) {
+        UWORD prevslot, newslot;
+        UWORD endslot = 255;
+        UWORD slotsize = (size + 0x00ffffff) / Z3SLOT;
+        if (eb_z3Slot == 0)
+            eb_z3Slot = 0x40000000 / Z3SLOT;
+        prevslot = eb_z3Slot;
+        // handle alignment
+        newslot = (prevslot + slotsize - 1) & ~(slotsize - 1);
+        KDEBUG(("size=%d prev=%d new=%d end=%d\n", slotsize, prevslot, newslot, endslot));
+        if (newslot + slotsize <= endslot) {
+            ULONG startaddr = newslot * Z3SLOT;
+            configDev->cd_BoardAddr = (APTR)startaddr;
+            configDev->cd_SlotAddr = eb_z3Slot;
+            configDev->cd_SlotSize = slotsize;
+            configDev->cd_Flags |= CDF_CONFIGME;
+            eb_z3Slot = newslot + slotsize;
+            writeexpansion(board, configDev, type, (startaddr >> 16));
+                    // Warning: UAE may change configDev->cd_BoardAddr in writeexpansion()
+                    KDEBUG(("-> configured, %p - %p\n", (void*)configDev->cd_BoardAddr, (void*)(((ULONG)configDev->cd_BoardAddr) + configDev->cd_BoardSize - 1)));
+            return TRUE;
+        }
+    } else {
+        ULONG start, end, addr, step;
+        UBYTE *space;
+        UBYTE area;
+
+        for (area = 0; area < 2; area++) {
+
+            if (area == 0 && (size >= 8 * E_SLOTSIZE || memorydevice))
+                continue;
+
+            if (area == 0) {
+                start = 0x00E90000;
+                end   = 0x00EFFFFF;
+            } else {
+                start = E_MEMORYBASE;
+                end   = E_MEMORYBASE + E_MEMORYSIZE - 1;
+            }
+            space = eb_z2Slots;
+            step = 0x00010000;
+            for (addr = start; addr < end; addr += step) {
+                ULONG startaddr = addr;
+                UWORD offset = startaddr / (E_SLOTSIZE * SLOTSPERBYTE);
+                SBYTE bit = 7 - ((startaddr / E_SLOTSIZE) % SLOTSPERBYTE);
+                UBYTE res = space[offset];
+                ULONG sizeleft = size;
+
+                if (res & (1 << bit))
+                    continue;
+
+                if (size < 4L * 1024 * 1024) {
+                    // handle alignment, 128k boards must be 128k aligned and so on..
+                    if ((startaddr & (size - 1)) != 0)
+                        continue;
+                } else {
+                    // 4M and 8M boards have different alignment requirements
+                    if (startaddr != 0x00200000 && startaddr != 0x00600000)
+                        continue;
+                }
+
+                // found free start address
+                if (size >= E_SLOTSIZE * SLOTSPERBYTE) {
+                    // needs at least 1 byte and is always aligned to byte
+                    while (space[offset] == 0 && sizeleft >= E_SLOTSIZE && offset <= end / (E_SLOTSIZE * SLOTSPERBYTE)) {
+                        offset++;
+                        sizeleft -= E_SLOTSIZE * SLOTSPERBYTE;
+                    }
+                } else {
+                    // bit by bit small board check (fits in one byte)
+                    while ((res & (1 << bit)) == 0 && sizeleft >= E_SLOTSIZE && bit >= 0) {
+                        sizeleft -= E_SLOTSIZE;
+                        bit--;
+                    }
+                }
+
+                if (sizeleft >= E_SLOTSIZE)
+                    continue;
+
+                configDev->cd_BoardAddr = (APTR)startaddr;
+                configDev->cd_Flags |= CDF_CONFIGME;
+                configDev->cd_SlotAddr = (startaddr >> 16);
+                configDev->cd_SlotSize = size >> 16;
+                writeexpansion(board, configDev, type, (startaddr >> 16));
+                KDEBUG(("-> configured, %p - %p\n", (void*)startaddr, (void*)(startaddr + configDev->cd_BoardSize - 1)));
+
+                // do not remove this, configDev->cd_BoardAddr
+                // might have changed inside writeexpansion
+                startaddr = (ULONG)configDev->cd_BoardAddr;
+                offset = startaddr / (E_SLOTSIZE * SLOTSPERBYTE);
+                bit = 7 - ((startaddr / E_SLOTSIZE) % SLOTSPERBYTE);
+                sizeleft = size;
+                // now allocate area we reserved
+                while (sizeleft >= E_SLOTSIZE) {
+                    space[offset] |= 1 << bit;
+                    sizeleft -= E_SLOTSIZE;
+                    bit--;
+                }
+
+                return TRUE;
+            }
+        }
+    }
+
+    KDEBUG(("Configuration failed!\n"));
+    if (!(configDev->cd_Flags & ERFF_NOSHUTUP)) {
+        configDev->cd_Flags |= CDF_SHUTUP;
+        WriteExpansionByte(board, 19, 0); // SHUT-UP!
+    } else {
+        // uh?
+    }
+    return FALSE;
 }
 
 /* Auto-configure all Zorro II/III expansion boards.
